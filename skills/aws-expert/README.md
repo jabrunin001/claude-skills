@@ -30,9 +30,10 @@ The hook prints nothing for allowed reads and ordinary commands, so the normal p
 
 **Layer differences (deliberate):**
 - Hook has no `if` filter: it must see every Bash call to ask on computed command words (`$CMD`, `"$SHELL" -c`, `$(...)`).
-- Hook only: profile pinning (incl. ask on `terraform plan|init` without `AWS_PROFILE=<ro-profile>`), `AWS_*` env overrides (on `aws`, `terraform`, `cdk`; `AWS_PROFILE=<ro-profile>` passes), wrappers, inline SDK code, `curl --aws-sigv4`, data-plane services (`bedrock-runtime`, `iot-data`, ...), name heuristics (`*password*`, `get-*token*`, `*credentials*`). Static rules list specific ops.
+- Hook only: profile pinning (incl. ask on `terraform plan|init` without `AWS_PROFILE=<ro-profile>`), `AWS_*` env overrides (on `aws`, `terraform`, `cdk`, `npx cdk`; `AWS_PROFILE=<ro-profile>` passes), wrappers, `source`/`.` of stdin, brace-expanded command words, `npx -c`, inline SDK code (python, node, bun, ruby, perl, deno), `curl --aws-sigv4`, glue `get-connection(s)` without `--hide-password` (static: ask), data-plane services (`bedrock-runtime`, `iot-data`, ...), name heuristics (`*password*`, `get-*token*`, `*credentials*`). Static rules list specific ops.
 - The hook tolerates `AWS_PROFILE=<ro-profile>` on `aws` calls too; `tool-boundary.md` still says `--profile` only (instruction is stricter).
-- Static only: `terraform`/`cdk`/`sam` subcommands and arguments, `~/.aws` file reads. cdk `--app`/`-a` is blocked by static deny rules only.
+- Static only: `cdk`/`sam` subcommands and arguments (incl. cdk `--app`/`-a`), `~/.aws` file reads, package scripts `npm|pnpm|yarn run deploy*|*deploy*|*destroy*|cdk*`. Both layers deny terraform mutations; the hook also when prefixed with `AWS_PROFILE=`.
+- Static `aws * <verb>-*` families (`create-`, `delete-`, `run-`, `test-`, `deploy`, ...) are **ask**, not deny (round 3): resource names that start with a verb (`test-cluster`, `deploy-web`) would hard-deny reads. The hook is the deny authority; if it is missing or crashes, AWS mutations prompt instead. Exact-op rules (s3 rm/cp, secrets, credentials, data reads, `--debug`, terraform/cdk mutations) stay deny.
 - Accepted (2026-09-29): `terraform plan` is auto-allowed without `-lock=false`. The `AWS_PROFILE=<ro-profile>` prefix is enforced as an ask: the hook asks on `terraform plan|init` without it (prefix, `env`, or earlier `export`), and wins over the static allow. With the prefix a lock attempt fails (read-only), so only an approved ambient-credential plan can take the lock.
 - `aws * start-*` and `sso login`: static ask; the hook denies every `start-*` except Athena/Logs Insights (ask). `tool-boundary.md` says the user runs `sso login`; the ask is the backstop.
 - Auto-allowed: `sts get-caller-identity`, `describe-*`, `list-*`, `s3 ls`, `pricing *`, `service-quotas get-*|list-*`, `terraform validate/plan`, `cdk`/`npx cdk`/`npx aws-cdk` `synth`/`diff`. Other `get-*` reads and Cost Explorer prompt. No allow rule starts with `*`.
@@ -57,7 +58,7 @@ The hook prints nothing for allowed reads and ordinary commands, so the normal p
 
 ## Editing guide
 
-- New allowed or forbidden AWS operation: update `tool-boundary.md`, then `aws-guard.py` (`ALLOW_*`, `DATA_OPS`, `ASK_OPS`, `SDK_RE`, `IAC_TOOLS`), then the matching rule in `settings-snippet.json`, then add a `CASES` row. Run `python3 aws-guard.py --selftest`.
+- New allowed or forbidden AWS operation: update `tool-boundary.md`, then `aws-guard.py` (`ALLOW_*`, `DATA_OPS`, `HIDE_PASSWORD_OPS`, `ASK_OPS`, `MUTATING_VERBS`, `SDK_RE`, `INLINE_FLAGS`, `TF_MUTATING`), then the matching rule in `settings-snippet.json`, then add a `CASES` row. Run `python3 aws-guard.py --selftest`.
 - Settings patterns match command text; a mid-pattern `*` spans spaces, so avoid token-like fragments (`*token*`) that hit `--next-token`.
 - Prices, quotas, eligibility lists: never hard-code; add the live source to `sources.md`.
 - Domain content goes in the matching reference; `SKILL.md` keeps only routing and core rules (<120 lines).
@@ -72,5 +73,7 @@ The hook prints nothing for allowed reads and ordinary commands, so the normal p
 | `hooks/aws-guard.py` | `~/.claude/hooks/aws-guard.py` | copy |
 | `settings/settings-snippet.json` | `~/.claude/settings.json` | merge: append `permissions.deny/ask/allow` entries and the `hooks.PreToolUse` entry; keep existing rules |
 | (planned edit, no staged file) | `~/.claude/settings.local.json` | move `Bash(python3 *)` from `allow` to `ask`; closes the prompt-free boto3 path |
+
+Conflict: the existing `Bash(npm run *)` and `Bash(npm test *)` allows in `settings.local.json` auto-run package scripts. The snippet's deny rules for `npm|pnpm|yarn run deploy*|*deploy*|*destroy*|cdk*` win over them, so those allows stay; any other script that calls cdk, terraform or boto3 still runs silently.
 
 Claude installs through `update-config` only after the user approves the exact diff. Restart Claude Code afterward; the first file in a new `~/.claude/agents/` directory is not picked up live.

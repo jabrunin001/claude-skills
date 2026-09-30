@@ -10,12 +10,13 @@ The command rules the persona follows live in `references/tool-boundary.md`.
 
 - `ReadOnlyAccess` grants content reads: `s3:GetObject`, `dynamodb:GetItem/Query/Scan/PartiQLSelect`, `logs:GetLogEvents/FilterLogEvents/StartLiveTail`, `sqs:ReceiveMessage`, `kinesis:GetRecords`, `ssm:GetParameter*`, `ecr:GetAuthorizationToken`, `sts:GetSessionToken`. You chose not to add an IAM deny for these.
 - The Claude-side layers (skill instructions, permission deny rules, `aws-guard` hook) match command text. They do not stop:
-  - a boto3 or other SDK **script file** (`python3 report.py`); inline `python -c`/`node -e` SDK code and `curl --aws-sigv4` are denied by `aws-guard`, script files are not read;
-  - `curl --aws-sigv4` requests to AWS APIs;
+  - a boto3 or other SDK **script file** (`python3 report.py`); inline SDK code (`python -c`, `node -e`, `ruby -e`, ...) and `curl --aws-sigv4` are denied by `aws-guard`, script files are not read;
+  - package scripts (`npm run <x>`) that call cdk, terraform or an SDK, except the denied `deploy`/`destroy`/`cdk` names; your `Bash(npm run *)` allow runs the rest without a prompt;
   - a renamed or symlinked `aws` binary, or `aws` calls inside a script file (`bash script.sh`);
   - obfuscation the guard cannot see through.
 - A command word computed at run time (`$CMD ...`, `"$SHELL" -c ...`, `$(...)`) gets a permission prompt from `aws-guard`, not a block. Approve it only if you can tell what runs.
 - `~/.claude/settings.local.json` allows `Bash(python3 *)`: in sessions started from your home directory, a boto3 script runs **without a prompt**. **Planned change (install step, applied with your diff approval):** move `Bash(python3 *)` from `allow` to `ask` in that file. After it, every `python3` call prompts, including the self-test in step 4.
+- AWS mutation verbs (`create-*`, `delete-*`, ...) are denied by `aws-guard`; the static rules only ask for them, so reads on resources named like `test-cluster` are not blocked. Keep the hook installed: without it, those mutations prompt instead of being denied.
 - The guard trusts the profile name. Every profile named `aws-expert-ro` or `aws-expert-ro-*` must use the `AWSExpertReadOnly` permission set; never give a write-capable profile such a name.
 - PHI accounts: the persona warns and waits for your go-ahead before any call there. Safer: do not point an `aws-expert-ro*` profile at an account holding PHI until you add the IAM deny below.
 - `terraform plan` without `-lock=false` runs without a prompt (accepted): it can take the state lock and block a teammate's apply until it finishes.

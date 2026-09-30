@@ -2,7 +2,7 @@
 
 Claude Code skills, agents, and guardrails.
 
-> **Status: draft.** `aws-expert` is authored, hardened, and simulated. Final validation is still in progress; expect updates.
+> **Status:** `aws-expert` is validated (ready with conditions) and has 3 rounds of fixes; the post-install smoke tests haven't run yet.
 
 ## aws-expert
 
@@ -35,6 +35,14 @@ Set up the read-only AWS profile by following `skills/aws-expert/SETUP.md`. Read
 
 - Ask any AWS design, cost, security, or IaC question — the skill loads automatically.
 - `/aws-expert` loads the skill explicitly; "use the aws-expert agent" runs the subagent.
+
+## course-to-setup
+
+Turns a course (transcript `.docx`/`.txt`/`.md` + `.ipynb` notebooks) into ranked Claude Code skill recommendations and a proposed setup structure, written as a note in the vault's `Projects/` folder.
+
+```bash
+cp -R ~/claude-skills/skills/course-to-setup ~/.claude/skills/
+```
 
 ## pre-pr-review
 

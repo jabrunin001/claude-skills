@@ -28,6 +28,13 @@ SAFE_AWS_ENV = {"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PAGER", "AWS_DEFAULT_OU
 AWS_ENV_RE = re.compile(r"(?<![A-Za-z0-9_])(AWS_[A-Za-z0-9_]+)=(['\"]?)([^\s'\";&|()]*)")
 SDK_RE = re.compile(r"boto3|botocore|aws-sdk")  # also matches @aws-sdk/...
 IAC_TOOLS = {"terraform", "cdk"}  # checked for AWS_* overrides; J4 pins them via AWS_PROFILE
+TF_MUTATING = {"apply", "destroy", "import", "state", "taint", "untaint", "refresh", "force-unlock", "login"}
+CDK_PACKAGES = {"cdk", "aws-cdk"}  # npx [opts] cdk|aws-cdk[@version]
+NPX_VALUE_OPTS = {"-p", "--package", "--cache", "--userconfig"}
+SOURCE_CMDS = {"source", "."}
+BRACE_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+INLINE_FLAGS = {"node": {"-e", "--eval", "-p", "--print"}, "bun": {"-e", "--eval", "-p", "--print"},
+                "ruby": {"-e"}, "perl": {"-e", "-E"}}
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 VAR_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
 DECLARERS = {"export", "readonly", "declare", "typeset", "local"}
@@ -62,7 +69,7 @@ CRED_INJECTORS = {"aws-vault", "assume", "granted", "aws-sso-util"}
 
 AWS_VALUE_OPTS = {"--profile", "--region", "--output", "--endpoint-url", "--query", "--ca-bundle",
                   "--cli-read-timeout", "--cli-connect-timeout", "--color", "--cli-binary-format"}
-AWS_FLAG_OPTS = {"--debug", "--no-verify-ssl", "--no-paginate", "--no-sign-request",
+AWS_FLAG_OPTS = {"--no-verify-ssl", "--no-paginate", "--no-sign-request",
                  "--no-cli-pager", "--cli-auto-prompt", "--no-cli-auto-prompt"}
 
 ALLOW_EXACT = {("s3", "ls"), ("configure", "list"), ("configure", "list-profiles"),
@@ -82,11 +89,28 @@ DATA_OPS = {
     ("ec2", "get-console-output"), ("ec2", "get-console-screenshot"),
     ("appconfig", "get-configuration"), ("appconfigdata", "get-latest-configuration"),
     ("rds", "generate-db-auth-token"), ("lightsail", "get-instance-access-details"),
+    ("cognito-idp", "list-users"), ("cognito-idp", "list-users-in-group"),
+    ("cognito-idp", "describe-user-pool-client"), ("stepfunctions", "describe-execution"),
+    ("stepfunctions", "get-execution-history"), ("ssm", "get-command-invocation"),
+    ("appsync", "list-api-keys"),
 }
 DATA_SERVICES = {"iot-data", "kinesis-video-media", "kinesis-video-archived-media",
                  "mediastore-data", "sagemaker-runtime", "bedrock-runtime",
                  "bedrock-agent-runtime", "qldb-session"}
 PASSWORD_OK = {"get-account-password-policy"}
+HIDE_PASSWORD_OPS = {("glue", "get-connection"), ("glue", "get-connections")}  # data unless --hide-password
+MUTATING_VERBS = {
+    "create", "delete", "put", "update", "modify", "attach", "detach", "associate", "disassociate",
+    "terminate", "stop", "start", "run", "reboot", "tag", "untag", "register", "deregister", "enable",
+    "disable", "restore", "import", "copy", "authorize", "revoke", "replace", "reset", "set", "cancel",
+    "send", "execute", "remove", "add", "upload", "accept", "reject", "purchase", "allocate", "release",
+    "apply", "rotate", "change", "initiate", "complete", "batch", "admin", "request", "assign",
+    "unassign", "promote", "failover", "purge", "schedule", "export", "retire", "generate", "test",
+    "upgrade", "resume", "suspend", "move", "transfer", "merge", "archive", "flush", "rebuild", "resize",
+    "restart", "switchover", "recover", "invoke", "publish", "deploy", "package", "subscribe",
+    "unsubscribe", "transact", "leave", "invite", "write", "continue", "signal", "monitor", "sign",
+    "encrypt", "cp", "mv", "rm", "sync", "mb", "rb", "presign", "website",
+}
 
 
 class ParseError(Exception):
@@ -405,7 +429,14 @@ def _with_env(ctx, words, run):
 
 def classify_terraform(argv, ctx):
     """plan/init need AWS credentials: without AWS_PROFILE=<ro-profile> they use the shell's."""
-    sub = next((w for w in argv[1:] if not w.startswith("-")), "")
+    words = [w for w in argv[1:] if not w.startswith("-")]
+    flags = [w for w in argv[1:] if w.startswith("-")]
+    sub, arg = (words + ["", ""])[:2]
+    if sub in TF_MUTATING or (sub == "workspace" and arg in ("new", "delete")) \
+            or (sub == "plan" and any(f.startswith("-out") for f in flags)) \
+            or (sub == "init" and "-migrate-state" in flags):
+        return [("deny", f"terraform {sub} changes state or writes a saved plan. A denied command is "
+                         "final: give it to the user as text under '# MUTATING: run yourself'.")]
     if sub not in ("plan", "init"):
         return [("defer", "terraform: static rules decide")]
     profile = ctx["env"].get("AWS_PROFILE", ctx["exported"].get("AWS_PROFILE", ""))
@@ -441,12 +472,21 @@ def classify_argv(argv, ctx, depth, via=None):
         if depth > MAX_DEPTH:
             return [("deny", "variable command word nests too deep; fail closed.")]
         return classify_dynamic(argv, ctx, depth, via)
+    if BRACE_RE.search(name):
+        if any(os.path.basename(w).lower() == "aws" for w in _brace_expand(name)):
+            return [("deny", f"brace expansion {name!r} can resolve to aws. Write the aws call literally.")]
+        return [("ask", f"command word {name!r} uses brace expansion; the hook cannot see what runs. "
+                        "Confirm it, or write the command literally.")]
     if any(ch in name for ch in "*?["):
         if fnmatch.fnmatchcase("aws", base):
             return [("deny", f"glob {name!r} can resolve to aws. Write the aws call literally.")]
         return []
-    if PYTHON_RE.match(base) or base == "node":
+    if PYTHON_RE.match(base) or base in INLINE_FLAGS or base == "deno":
         return classify_interpreter(base, argv, ctx)
+    if base in SOURCE_CMDS:
+        return classify_source(argv, ctx)
+    if base == "npx":
+        return classify_npx(argv, ctx, depth)
     if base == "curl":
         if any(w.startswith("--aws-sigv4") for w in argv[1:]):
             return [("deny", "curl --aws-sigv4 calls AWS APIs outside the aws CLI rules. Use the aws CLI.")]
@@ -493,18 +533,22 @@ def classify_argv(argv, ctx, depth, via=None):
 
 
 def classify_interpreter(base, argv, ctx):
-    """python*/node running inline or stdin code that uses an AWS SDK -> deny.
+    """python*/node/bun/ruby/perl/deno running inline or stdin code that uses an AWS SDK -> deny.
     Script files are not read (residual risk, see SETUP)."""
-    if base != "node" and "-m" in argv and argv.index("-m") + 1 < len(argv) \
+    python = PYTHON_RE.match(base)
+    if python and "-m" in argv and argv.index("-m") + 1 < len(argv) \
             and argv[argv.index("-m") + 1] == "awscli":
         return [("deny", "python -m awscli bypasses the aws CLI rules. Use the aws CLI directly.")]
-    node = base == "node"
-    inline_flags = {"-e", "--eval", "-p", "--print"} if node else set()
-    value_opts = {"-r", "--require", "--import"} if node else {"-W", "-X", "-Q"}
+    inline_flags = INLINE_FLAGS.get(base, set())
+    value_opts = {"-W", "-X", "-Q"} if python else {"-r", "--require", "--import", "-I"}
     code, script, k = [], None, 1
+    if base == "deno":
+        code = argv[2:3] if argv[1:2] == ["eval"] else []
+        script = None if code else (argv[1] if len(argv) > 1 else None)
+        k = len(argv)
     while k < len(argv):
         w = argv[k]
-        if w in inline_flags or (not node and re.match(r"^-[A-Za-z]*c$", w)):
+        if w in inline_flags or (python and re.match(r"^-[A-Za-z]*c$", w)):
             code.append(argv[k + 1] if k + 1 < len(argv) else "")
             break
         if w in value_opts:
@@ -515,10 +559,46 @@ def classify_interpreter(base, argv, ctx):
             break
         k += 1
     stdin = not code and (script == "-" or len(argv) == 1)
-    if (code and any(SDK_RE.search(c) for c in code)) or (stdin and ctx["sdk"]):
+    if (code and any(SDK_RE.search(w) for w in argv[1:])) or (stdin and ctx["sdk"]):
         return [("deny", f"{base} inline code uses an AWS SDK (boto3/botocore/aws-sdk), which bypasses "
                          "the aws CLI rules. Use the aws CLI with the read-only profile.")]
     return []
+
+
+def classify_source(argv, ctx):
+    """source/. run a file in this shell: stdin-like targets are checked like `sh` reading stdin."""
+    target = argv[1] if len(argv) > 1 else "-"
+    if (target in ("-", SUBST) or target.startswith("/dev/stdin") or target.startswith("/dev/fd/")) \
+            and ctx["mentions"]:
+        return [("deny", f"{argv[0]} runs commands from stdin or a substitution in a command that "
+                         "mentions aws. Run aws directly.")]
+    return []
+
+
+def classify_npx(argv, ctx, depth):
+    """npx -c runs a shell string; npx cdk|aws-cdk joins the cdk branch (AWS_* checks)."""
+    k = 1
+    while k < len(argv) and argv[k].startswith("-"):
+        w = argv[k]
+        if w in ("-c", "--call") and k + 1 < len(argv):
+            return nested(argv[k + 1], ctx, depth)
+        k += 2 if w in NPX_VALUE_OPTS else 1
+    pkg = argv[k].rsplit("@", 1)[0] if k < len(argv) and not argv[k].startswith("@") else ""
+    if pkg in CDK_PACKAGES:
+        return [("defer", "npx cdk: static rules decide; AWS_* overrides checked")]
+    return []
+
+
+def _brace_expand(word, limit=64):
+    m = BRACE_RE.search(word)
+    if not m:
+        return [word]
+    out = []
+    for alt in m.group(1).split(","):
+        out += _brace_expand(word[:m.start()] + alt + word[m.end():], limit)
+        if len(out) > limit:
+            break
+    return out
 
 
 def classify_shell(argv, ctx, depth):
@@ -575,24 +655,28 @@ def classify_op(svc, op, args):
     if svc == "configure":
         if op in ("list", "list-profiles"):
             return "defer", f"read: aws configure {op}"
-        return "deny", f"aws configure {op} reads or writes credentials/config. The user runs it himself."
+        return "deny", f"aws configure {op} reads or writes credentials/config. The user runs it themselves."
     if (svc, op) in DATA_OPS or svc in DATA_SERVICES or op.startswith("get-object") \
             or op == "get-records" or op.startswith("get-statement-result") \
             or (svc == "ssm" and op.startswith("get-parameter")) or "--with-decryption" in args \
-            or any(a.startswith("--include-value") for a in args):
+            or any(a.startswith("--include-value") for a in args) \
+            or ((svc, op) in HIDE_PASSWORD_OPS and "--hide-password" not in args):
         return "deny", f"aws {svc} {op} reads data or secret content, not metadata. Forbidden."
     if "secret-value" in op or ("password" in op and op not in PASSWORD_OK) \
             or (op.startswith("get-") and "token" in op) or "credentials" in op \
             or op.startswith("assume-role"):
         return "deny", f"aws {svc} {op} returns secrets, tokens or credentials. Forbidden."
     if (svc, op) == ("sso", "login"):
-        return "ask", "aws sso login opens a browser sign-in. The user signs in himself; approve only if you started it."
+        return "ask", "aws sso login opens a browser sign-in. The user signs in themselves; approve only if you started it."
     if (svc, op) in ASK_OPS:
         return "ask", f"aws {svc} {op} is a paid or data-exposing query. Confirm scope and cost with the user."
     if (svc, op) in ALLOW_EXACT or op.startswith(ALLOW_PREFIXES):
         return "defer", f"read: aws {svc} {op}"
-    return "deny", (f"aws {svc} {op} is not an allowed read (describe-/list-/get- metadata only). "
-                    "A denied command is final: give it to the user as text under '# MUTATING: run yourself'.")
+    if op.split("-", 1)[0] in MUTATING_VERBS:
+        return "deny", (f"aws {svc} {op} changes AWS state. A denied command is final: "
+                        "give it to the user as text under '# MUTATING: run yourself'.")
+    return "deny", (f"aws {svc} {op} is not in the read allowlist (describe-/list-/get- metadata only). "
+                    "A denied command is final: give it to the user as text to run themselves.")
 
 
 def classify_aws(argv):
@@ -618,6 +702,8 @@ def classify_aws(argv):
     if not pos:
         return "deny", "aws call without a service and operation."
     svc, op = pos[0].lower(), (pos[1].lower() if len(pos) > 1 else "")
+    if "--debug" in args:
+        return "deny", "aws --debug prints signed request headers, including the session token. Forbidden."
     if svc == "help" or op == "help":
         return "defer", "aws help"
     if not op:
@@ -863,6 +949,56 @@ CASES = [
     ("deny", f"aws apigateway get-api-keys --include-values {P}"),
     ("deny", f"aws apigateway get-api-key --api-key k1 --include-value {P}"),
     ("defer", f"aws apigateway get-api-keys {P}"),
+    # validation B7, B9-B13 (H1 data-returning reads, --debug)
+    ("deny", f"aws sts get-caller-identity {P} --debug"),
+    ("deny", f"aws --debug sts get-caller-identity {P}"),
+    ("deny", f"aws cognito-idp list-users --user-pool-id X {P}"),
+    ("deny", f"aws cognito-idp list-users-in-group --user-pool-id X --group-name g {P}"),
+    ("deny", f"aws stepfunctions describe-execution --execution-arn arn:x {P}"),
+    ("deny", f"aws stepfunctions get-execution-history --execution-arn arn:x {P}"),
+    ("deny", f"aws glue get-connection --name db {P}"),
+    ("deny", f"aws glue get-connections {P}"),
+    ("deny", f"aws ssm get-command-invocation --command-id c --instance-id i-1 {P}"),
+    ("deny", f"aws cognito-idp describe-user-pool-client --user-pool-id X --client-id Y {P}"),
+    ("deny", f"aws appsync list-api-keys --api-id a {P}"),
+    ("defer", f"aws glue get-connection --name db --hide-password {P}"),
+    ("defer", f"aws iam list-users {P}"),
+    ("defer", f"aws cognito-idp list-user-pools --max-results 10 {P}"),
+    ("defer", f"aws stepfunctions describe-state-machine --state-machine-arn arn:x {P}"),
+    ("defer", f"aws stepfunctions list-executions --state-machine-arn arn:x {P}"),
+    # validation B1-B6, B8 (shell forms, pinned terraform mutations, npx cdk, other interpreters)
+    ("deny", f"bash -c '{{aws,}} s3 rm s3://b/k --recursive {P}'"),
+    ("deny", f'source <(echo "aws s3 rm s3://b/k {P}")'),
+    ("deny", f'. /dev/stdin <<< "aws s3 rm s3://b/k {P}"'),
+    ("deny", f"AWS_PROFILE={PROFILE} terraform apply -auto-approve"),
+    ("deny", f"AWS_PROFILE={PROFILE} terraform plan -lock=false -out=tfplan"),
+    ("deny", "AWS_PROFILE=admin npx cdk diff"),
+    ("deny", "ruby -e \"require 'aws-sdk-s3'; Aws::S3::Client.new.get_object(bucket: 'b', key: 'k')\""),
+    ("deny", f"AWS_PROFILE={PROFILE} terraform -chdir=infra destroy"),
+    ("deny", f"AWS_PROFILE={PROFILE} terraform state rm aws_s3_bucket.b"),
+    ("deny", f"AWS_PROFILE={PROFILE} terraform workspace new tmp"),
+    ("deny", f"AWS_PROFILE={PROFILE} terraform plan -lock=false -out tfplan"),
+    ("deny", f"AWS_PROFILE={PROFILE} terraform init -migrate-state"),
+    ("deny", "terraform import aws_s3_bucket.b b"),
+    ("deny", "AWS_PROFILE=admin npx --yes aws-cdk@2 diff"),
+    ("deny", f"npx -c 'aws s3 rm s3://b/k {P}'"),
+    ("deny", "perl -e 'use Paws; use aws-sdk'"),
+    ("deny", "bun -e \"import {S3Client} from '@aws-sdk/client-s3'\""),
+    ("deny", "deno eval \"import {S3Client} from 'npm:@aws-sdk/client-s3'\""),
+    ("deny", f"/usr/local/bin/a{{w,x}}s s3 ls {P}"),
+    ("ask", "{ls,} -la"),
+    ("defer", f"AWS_PROFILE={PROFILE} terraform workspace list"),
+    ("defer", f"AWS_PROFILE={PROFILE} npx --yes aws-cdk@2 diff"),
+    ("defer", "npx cdk synth"),
+    ("defer", "npx eslint ."),
+    ("defer", "source ~/.zshrc"),
+    ("defer", ". ./venv/bin/activate"),
+    ("defer", "{ echo hi; echo there; }"),
+    ("defer", "ruby -e 'puts 1'"),
+    ("defer", "perl -e 'print 1'"),
+    ("defer", "deno eval 'console.log(1)'"),
+    ("defer", "bun -e 'console.log(1)'"),
+    ("defer", "echo {a,b}.txt"),
     # sso login: ask with its own reason
     ("ask", f"aws sso login {P}"),
 ]
